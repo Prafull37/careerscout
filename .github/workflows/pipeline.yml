@@ -1,0 +1,141 @@
+name: Careerscout Pipeline
+
+# Nightly discovery pipeline + manual runs.
+# Stage 1 (probe-ats): sharded slug probing against 14 unauthenticated ATS APIs.
+#   Results go to probe_results_<shard>.json artifacts and (if DATABASE_URL
+#   secret is set) upserted into the hosted Postgres.
+# Stage 2 (fetch-jobs): pull live job listings for every confirmed source.
+#
+# One-time setup:
+#   1. Create a free Postgres (Supabase / Neon) and run schema/001_initial.sql
+#      + migrations/005_new_data_layer.sql on it.
+#   2. Add repository secret DATABASE_URL with that connection string.
+# Without the secret the pipeline still runs and stores results as artifacts.
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # nightly, 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: "Max parallel probe shards"
+        default: "10"
+      slugs_per_shard:
+        description: "Slugs per shard"
+        default: "20000"
+      stages:
+        description: "Stages to run: probe, fetch"
+        default: "probe,fetch"
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.22"
+
+jobs:
+  build-slugs:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build slug shards from public datasets
+        id: set
+        run: |
+          SHARDS="${{ github.event.inputs.shards || '10' }}"
+          PER="${{ github.event.inputs.slugs_per_shard || '20000' }}"
+          python3 scripts/build_slug_shards.py --shards "$SHARDS" --per-shard "$PER" --out-dir shards
+          MATRIX=$(python3 -c "
+          import json,glob
+          files = sorted(glob.glob('shards/slugs_shard_*.json'))
+          print(json.dumps(list(range(len(files)))))
+          ")
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+      - name: Upload slug shards
+        uses: actions/upload-artifact@v4
+        with:
+          name: slug-shards
+          path: shards/
+          retention-days: 3
+
+  probe-ats:
+    needs: build-slugs
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        shard: ${{ fromJson(needs.build-slugs.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Download slug shard
+        uses: actions/download-artifact@v4
+        with:
+          name: slug-shards
+          path: shards/
+
+      - name: Restore checkpoint (per-shard)
+        uses: actions/cache@v4
+        with:
+          path: probe_checkpoint.json
+          key: probe-ckpt-${{ matrix.shard }}
+
+      - name: Probe ATS endpoints (shard ${{ matrix.shard }})
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SLUGS_FILE: shards/slugs_shard_${{ matrix.shard }}.json
+        run: go run ./cmd/probe_ats
+
+      - name: Rename results
+        run: |
+          [ -f probe_results.json ] && cp probe_results.json probe_results_${{ matrix.shard }}.json || echo "[]" > probe_results_${{ matrix.shard }}.json
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-results-${{ matrix.shard }}
+          path: probe_results_${{ matrix.shard }}.json
+          retention-days: 14
+
+  fetch-jobs:
+    needs: probe-ats
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    if: ${{ contains(github.event.inputs.stages || 'probe,fetch', 'fetch') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Fetch jobs from confirmed sources
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "DATABASE_URL not set - skipping job fetch (results would have nowhere to persist)."
+            exit 0
+          fi
+          WORKER_COUNT=20 go run ./cmd/fetch_jobs
+
+      - name: Job count summary
+        if: ${{ secrets.DATABASE_URL != '' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          sudo apt-get install -y postgresql-client > /dev/null 2>&1 || true
+          psql "$DATABASE_URL" -c "SELECT count(*) AS total_jobs FROM jobs;" || true

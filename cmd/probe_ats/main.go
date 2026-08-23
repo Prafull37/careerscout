@@ -49,6 +49,7 @@ var (
 		"rippling":   rate.NewLimiter(rate.Limit(5), 5),
 		"pinpoint":   rate.NewLimiter(rate.Limit(5), 5),
 		"freshteam":  rate.NewLimiter(rate.Limit(5), 5),
+		"smartrecruiters": rate.NewLimiter(rate.Limit(5), 5),
 		"jobvite":    rate.NewLimiter(rate.Limit(5), 5),
 		"breezyhr":   rate.NewLimiter(rate.Limit(5), 5),
 		"personio":   rate.NewLimiter(rate.Limit(5), 5),
@@ -721,7 +722,16 @@ func main() {
 	testRun := os.Getenv("PROBE_TEST") == "1"
 
 	var allSlugs []string
-	if testRun {
+	if slugsFile := os.Getenv("SLUGS_FILE"); slugsFile != "" {
+		data, err := os.ReadFile(slugsFile)
+		if err != nil {
+			log.Fatalf("failed to read SLUGS_FILE %s: %v", slugsFile, err)
+		}
+		if err := json.Unmarshal(data, &allSlugs); err != nil {
+			log.Fatalf("failed to parse SLUGS_FILE %s: %v", slugsFile, err)
+		}
+		fmt.Printf("Startup: Loaded %d slugs from SLUGS_FILE=%s.\n", len(allSlugs), slugsFile)
+	} else if testRun {
 		allSlugs = testSlugs
 		fmt.Printf("Startup: Running PROBE_TEST=1 with %d explicit slugs.\n", len(allSlugs))
 	} else {
